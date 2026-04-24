@@ -309,7 +309,7 @@ if page == "Dashboard":
         end_date = st.date_input("End Date", value=datetime(2024, 3, 31), key="ts_end")
     
     np.random.seed(int(start_date.toordinal()))
-    dates = pd.date_range(start=start_date, end=end_date, freq='H')
+    dates = pd.date_range(start=start_date, end=end_date, freq='1h')
     n_hours = len(dates)
     
     base_fraud_rate = 0.018 + (st.session_state.live_metrics['flagged'] / max(st.session_state.live_metrics['total'], 1)) * 0.1
