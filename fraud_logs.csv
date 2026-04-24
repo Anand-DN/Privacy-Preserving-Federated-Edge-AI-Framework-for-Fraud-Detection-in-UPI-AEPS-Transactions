@@ -1,3 +1,5 @@
-utr_number,bank,amount,timestamp,device,velocity,is_night,fraud_probability,risk_level,reason
-UPI42807697,Bank B,50000,2026-04-24 20:07:35,mobile,0.5,True,0.4086,MEDIUM,"High amount, Night transaction, Mobile device"
-UPI53945879,Bank A,50000,2026-04-24 20:07:55,mobile,0.5,True,0.372,MEDIUM,"High amount, Night transaction, Mobile device"
+utr_number,amount,timestamp,device,velocity,is_night,fraud_probability,risk_level
+UPI78818311,5000,2026-04-24 21:01:21,mobile,0.5,False,0.049,LOW
+UPI85548350,5400,2026-04-24 21:01:29,mobile,0.5,False,0.189,LOW
+UPI99036450,5400,2026-04-24 21:01:32,mobile,0.5,False,0.189,LOW
+UPI73825726,5400,2026-04-24 21:01:34,mobile,0.5,True,0.3036,MEDIUM
