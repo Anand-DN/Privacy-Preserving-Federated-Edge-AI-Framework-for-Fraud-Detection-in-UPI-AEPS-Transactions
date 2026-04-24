@@ -1,0 +1,39 @@
+{
+  "configuration": {
+    "data_path": "data/",
+    "epsilon": 3.0,
+    "delta": 1e-05,
+    "noise_multiplier": 0.3,
+    "max_rounds": 5,
+    "clip_norm": 2.0,
+    "byzantine_tolerance": 1,
+    "momentum": 0.8,
+    "test_size": 0.2,
+    "random_seed": 42
+  },
+  "model_comparison": {
+    "lr": {
+      "auc": 0.9940121802347389,
+      "f1": 0.6470588235294118
+    },
+    "rf": {
+      "auc": 0.9997940965487925,
+      "f1": 0.972972972972973
+    },
+    "mlp": {
+      "auc": 0.9968451848966092,
+      "f1": 0.819672131147541
+    }
+  },
+  "best_model": "rf",
+  "privacy_budget": {
+    "total_epsilon_spent": 15.0,
+    "max_rounds": 5
+  },
+  "unique_features": [
+    "Differential Privacy (Gaussian)",
+    "Secure Aggregation + Signatures",
+    "Multi-model Comparison (LR/RF/MLP)",
+    "Per-Bank Evaluation"
+  ]
+}
