@@ -347,7 +347,7 @@ if page == "Dashboard":
     end_dt = pd.to_datetime(end_date)
     seed_value = int(start_date.toordinal()) + int(end_date.toordinal())
     np.random.seed(seed_value)
-    dates = pd.date_range(start=start_dt, end=end_dt, freq='H')
+    dates = pd.date_range(start=start_dt, end=end_dt, freq='1h')
     n_hours = len(dates)
     
     seasonal_factor = 1 + 0.3 * np.sin(2 * np.pi * dates.dayofyear / 365)
