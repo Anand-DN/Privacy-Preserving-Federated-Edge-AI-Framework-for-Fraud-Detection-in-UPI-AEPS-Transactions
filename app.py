@@ -181,12 +181,42 @@ if 'date_range' not in st.session_state:
 def toggle_simulation():
     st.session_state.simulation_running = not st.session_state.simulation_running
 
+def toggle_auto_refresh():
+    st.session_state.auto_refresh = not st.session_state.auto_refresh
+
+def toggle_auto_refresh():
+    st.session_state.auto_refresh = not st.session_state.auto_refresh
+
 def reset_live_data():
     st.session_state.live_predictions = []
     st.session_state.live_metrics = {'total': 0, 'flagged': 0, 'blocked_amount': 0, 'last_update': datetime.now()}
 
-def simulate_transaction():
-    if st.session_state.simulation_running:
+def save_to_fraud_history(tx_data):
+    import datetime as dt
+    fraud_case = {
+        "utr_number": tx_data['utr'],
+        "amount": tx_data['amount'],
+        "timestamp": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "device": tx_data.get('device', 'mobile'),
+        "velocity": tx_data.get('velocity', 0.5),
+        "is_night": tx_data.get('is_night', False),
+        "fraud_probability": round(tx_data['fraud_prob'], 4),
+        "risk_level": tx_data['risk']
+    }
+    
+    fraud_df = pd.DataFrame([fraud_case])
+    fraud_log_file = "fraud_logs.csv"
+    if os.path.exists(fraud_log_file):
+        old_df = pd.read_csv(fraud_log_file)
+        new_df = pd.concat([old_df, fraud_df], ignore_index=True)
+    else:
+        new_df = fraud_df
+    new_df.to_csv(fraud_log_file, index=False)
+
+def simulate_transactions(count=3):
+    for _ in range(count):
+        if not st.session_state.simulation_running:
+            break
         amount = np.random.lognormal(8.5, 1.2)
         velocity = np.random.beta(2, 5)
         is_night = np.random.random() < 0.15
@@ -217,6 +247,9 @@ def simulate_transaction():
             'amount': int(amount),
             'bank': bank,
             'location': location,
+            'device': device,
+            'velocity': round(velocity, 3),
+            'is_night': is_night,
             'fraud_prob': fraud_prob,
             'risk': risk
         }
@@ -224,6 +257,8 @@ def simulate_transaction():
         st.session_state.live_predictions.insert(0, tx)
         if len(st.session_state.live_predictions) > 100:
             st.session_state.live_predictions.pop()
+        
+        save_to_fraud_history(tx)
         
         st.session_state.live_metrics['total'] += 1
         if risk != "LOW":
@@ -308,16 +343,18 @@ if page == "Dashboard":
     with date_col2:
         end_date = st.date_input("End Date", value=datetime(2024, 3, 31), key="ts_end")
     
-    np.random.seed(int(start_date.toordinal()))
-    dates = pd.date_range(start=start_date, end=end_date, freq='1h')
+    seed_value = int(start_date.toordinal()) + int(end_date.toordinal())
+    np.random.seed(seed_value)
+    dates = pd.date_range(start=start_date, end=end_date, freq='H')
     n_hours = len(dates)
     
+    seasonal_factor = 1 + 0.3 * np.sin(2 * np.pi * dates.dayofyear / 365)
     base_fraud_rate = 0.018 + (st.session_state.live_metrics['flagged'] / max(st.session_state.live_metrics['total'], 1)) * 0.1
     
     fraud_trends = pd.DataFrame({
         'timestamp': dates,
-        'total_transactions': np.random.randint(800, 2500, n_hours),
-        'fraud_cases': np.random.poisson(15, n_hours),
+        'total_transactions': (np.random.randint(800, 2500, n_hours) * seasonal_factor).astype(int),
+        'fraud_cases': np.random.poisson(15 * seasonal_factor, n_hours),
         'amount': np.random.lognormal(8, 1.5, n_hours).astype(int)
     })
     fraud_trends['fraud_rate'] = (fraud_trends['fraud_cases'] / fraud_trends['total_transactions'] * 100).round(2)
@@ -567,10 +604,10 @@ elif page == "Live Prediction":
     with sim_col2:
         st.button("Reset Data", on_click=reset_live_data)
     with sim_col3:
-        st.checkbox("Auto-refresh (2s)", value=st.session_state.auto_refresh, key="auto_refresh")
+        st.checkbox("Auto-refresh (2s)", value=st.session_state.auto_refresh, key="auto_refresh", on_change=toggle_auto_refresh)
     
     if st.session_state.simulation_running:
-        simulate_transaction()
+        simulate_transactions(3)
     
     # Dynamic metrics
     total = st.session_state.live_metrics['total']
@@ -772,18 +809,20 @@ elif page == "Fraud History":
     if os.path.exists(fraud_log_file):
         fraud_logs = pd.read_csv(fraud_log_file)
         
+        flagged = fraud_logs[fraud_logs['risk_level'].isin(['MEDIUM', 'HIGH'])] if 'risk_level' in fraud_logs.columns else pd.DataFrame()
+        high_risk = fraud_logs[fraud_logs['risk_level'] == 'HIGH'] if 'risk_level' in fraud_logs.columns else pd.DataFrame()
+        
         col_f1, col_f2, col_f3 = st.columns(3)
         with col_f1:
-            st.metric("Total Cases", f"{len(fraud_logs)}")
+            st.metric("Total Cases", f"{len(flagged)}")
         with col_f2:
-            high_risk = len(fraud_logs[fraud_logs['risk_level'] == 'HIGH']) if 'risk_level' in fraud_logs.columns else 0
-            st.metric("High Risk", f"{high_risk}")
+            st.metric("High Risk", f"{len(high_risk)}")
         with col_f3:
-            total_amount = fraud_logs['amount'].sum() if 'amount' in fraud_logs.columns else 0
+            total_amount = flagged['amount'].sum() if 'amount' in flagged.columns else 0
             st.metric("Amount Blocked", f"₹{total_amount:,}")
         
         st.markdown("### Case Details")
-        st.dataframe(fraud_logs, use_container_width=True)
+        st.dataframe(flagged, use_container_width=True)
         
         col_dl, _ = st.columns([1, 3])
         with col_dl:
