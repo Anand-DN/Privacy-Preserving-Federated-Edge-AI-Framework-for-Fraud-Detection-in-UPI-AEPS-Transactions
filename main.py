@@ -1,353 +1,860 @@
-# =========================================
-# FEDERATED FRAUD DETECTION
-# ENHANCED PIPELINE
-# =========================================
+"""Research-grade federated UPI fraud detection pipeline.
 
+This script trains and evaluates:
+- centralized logistic regression baseline
+- local-only bank baselines
+- FedAvg
+- differentially private FedAvg
+- robust DP-FedAvg under a Byzantine client attack
+
+The implementation keeps raw bank data local during federated training and only
+shares clipped model updates.
+"""
+
+from __future__ import annotations
+
+import json
+import pickle
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Tuple
+
+import matplotlib
+
+matplotlib.use("Agg")
+
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    accuracy_score,
+    average_precision_score,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
+from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression as SklearnLogisticRegression
 from sklearn.neural_network import MLPClassifier
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import (
-    roc_auc_score, classification_report, roc_curve,
-    f1_score, precision_score, recall_score
-)
-import json
-import hashlib
-import time
+
+
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+BANK_FILES = {
+    "Bank A": DATA_DIR / "bank_A.csv",
+    "Bank B": DATA_DIR / "bank_B.csv",
+    "Bank C": DATA_DIR / "bank_C.csv",
+}
 
 CONFIG = {
-    'data_path': 'data/',
-    'epsilon': 3.0,
-    'delta': 1e-5,
-    'noise_multiplier': 0.3,
-    'max_rounds': 5,
-    'clip_norm': 2.0,
-    'byzantine_tolerance': 1,
-    'momentum': 0.8,
-    'test_size': 0.2,
-    'random_seed': 42
+    "random_seed": 42,
+    "test_size": 0.20,
+    "validation_size": 0.20,
+    "federated_rounds": 18,
+    "local_epochs": 4,
+    "batch_size": 128,
+    "learning_rate": 0.08,
+    "server_learning_rate": 1.0,
+    "l2": 1e-4,
+    "clip_norm": 1.5,
+    "noise_multiplier": 0.30,
+    "delta": 1e-5,
+    "attack_client": "Bank C",
+    "attack_round_start": 7,
+    "attack_round_end": 12,
+    "attack_scale": 4.0,
 }
 
-np.random.seed(CONFIG['random_seed'])
+DROP_COLUMNS = {
+    "transaction_id",
+    "timestamp",
+    "utr_number",
+    "bank_id",
+}
+LABEL = "is_fraud"
 
-def compute_sigma():
-    return CONFIG['clip_norm'] * CONFIG['noise_multiplier'] * np.sqrt(2 * np.log(1.25 / CONFIG['delta'])) / CONFIG['epsilon']
 
-def dp_clip(gradients, clip_norm):
-    norm = np.linalg.norm(gradients)
-    if norm > clip_norm:
-        return gradients * (clip_norm / norm)
-    return gradients
+@dataclass
+class BankDataset:
+    name: str
+    X_train: np.ndarray
+    y_train: np.ndarray
+    X_val: np.ndarray
+    y_val: np.ndarray
+    X_test: np.ndarray
+    y_test: np.ndarray
+    train_count: int
+    fraud_train_count: int
 
-def dp_noise(gradients, sigma):
-    return gradients + np.random.normal(0, sigma, gradients.shape)
 
-class SecureChannel:
-    def __init__(self, secret_key):
-        self.secret_key = secret_key.encode()
-    
-    def sign(self, data):
-        return hashlib.sha256(f"{data}{time.time()}".encode()).hexdigest()[:16]
+def sigmoid(z: np.ndarray) -> np.ndarray:
+    return 1.0 / (1.0 + np.exp(-np.clip(z, -40, 40)))
 
-class SecureAggregation:
-    def __init__(self, byzantine_tolerance):
-        self.byzantine_tolerance = byzantine_tolerance
-        self.client_updates = []
-    
-    def add_update(self, weight, intercept, bank_id):
-        sig = hashlib.sha256(f"{bank_id}{time.time()}".encode()).hexdigest()[:16]
-        self.client_updates.append((weight, intercept, sig))
-    
-    def aggregate(self):
-        weights = [w for w, _, _ in self.client_updates]
-        intercepts = [b for _, b, _ in self.client_updates]
-        
-        weight_medians = np.median(weights, axis=0)
-        deviations = [np.linalg.norm(w - weight_medians) for w in weights]
-        threshold = np.percentile(deviations, 75)
-        
-        valid = [(w, b) for w, b, d in zip(weights, intercepts, deviations) if d <= threshold]
-        
-        self.client_updates = []
-        if valid:
-            return np.mean([w for w, _ in valid], axis=0), np.mean([b for _, b in valid], axis=0)
-        return weights[0], intercepts[0]
 
-def load_global_data():
-    df_all = pd.concat([
-        pd.read_csv(CONFIG['data_path'] + 'bank_A.csv'),
-        pd.read_csv(CONFIG['data_path'] + 'bank_B.csv'),
-        pd.read_csv(CONFIG['data_path'] + 'bank_C.csv')
-    ])
-    df_all = pd.get_dummies(df_all, columns=['device_type', 'upi_app', 'location'], drop_first=True)
-    df_all = df_all.drop(['transaction_id', 'timestamp', 'utr_number'], axis=1)
-    return df_all
+def predict_probability(weights: np.ndarray, bias: float, X: np.ndarray) -> np.ndarray:
+    return sigmoid(X @ weights + bias)
 
-def load_bank_data(file_path, columns, scaler, test_size=0.2):
-    df = pd.read_csv(file_path)
-    df = pd.get_dummies(df, columns=['device_type', 'upi_app', 'location'], drop_first=True)
-    df = df.drop(['transaction_id', 'timestamp', 'utr_number'], axis=1)
-    df = df.reindex(columns=list(columns) + ['is_fraud'], fill_value=0)
-    
-    X = df.drop('is_fraud', axis=1).values
-    y = df['is_fraud'].values
-    
-    indices = np.arange(len(X))
-    np.random.shuffle(indices)
-    train_count = int((1 - test_size) * len(X))
-    train_idx, test_idx = indices[:train_count], indices[train_count:]
-    
-    X_train = scaler.transform(X[train_idx])
-    X_test = scaler.transform(X[test_idx])
-    y_train = y[train_idx]
-    y_test = y[test_idx]
-    
-    return X_train, X_test, y_train, y_test
 
-def train_local(X_train, y_train, model_type='lr'):
-    if model_type == 'lr':
-        model = LogisticRegression(max_iter=2000, class_weight='balanced', solver='liblinear')
-    elif model_type == 'rf':
-        model = RandomForestClassifier(n_estimators=50, max_depth=5, class_weight='balanced', random_state=42)
-    elif model_type == 'mlp':
-        model = MLPClassifier(hidden_layer_sizes=(32, 16), max_iter=500, random_state=42)
-    
-    model.fit(X_train, y_train)
-    return model
+def safe_roc_auc(y_true: np.ndarray, y_score: np.ndarray) -> float:
+    if len(np.unique(y_true)) < 2:
+        return float("nan")
+    return float(roc_auc_score(y_true, y_score))
 
-def federated_round(round_num, dp_accum, sec_agg, channel, model_type='lr'):
-    print(f"\n--- FEDERATED ROUND {round_num}/{CONFIG['max_rounds']} ---")
-    
-    banks = [("Bank A", CONFIG['data_path'] + 'bank_A.csv'),
-            ("Bank B", CONFIG['data_path'] + 'bank_B.csv'),
-            ("Bank C", CONFIG['data_path'] + 'bank_C.csv')]
-    
-    sigma = compute_sigma()
-    
-    for name, file_path in banks:
-        X_train, _, y_train, _ = load_bank_data(file_path, columns, scaler)
-        
-        model = train_local(X_train, y_train, model_type)
-        
-        if model_type == 'lr':
-            coef = model.coef_.copy()
-            intercept = model.intercept_.copy()
-            coef = dp_clip(coef, CONFIG['clip_norm'])
-            intercept = dp_clip(intercept, CONFIG['clip_norm'])
-            sig = channel.sign(coef.tobytes())
-            coef = dp_noise(coef, sigma)
-            intercept = dp_noise(intercept, sigma)
-            sec_agg.add_update(coef, intercept, name)
-        
-        print(f"  {name}: Model trained")
-    
-    dp_accum += CONFIG['epsilon']
-    return dp_accum
 
-def evaluate_batch(w, b, X_test, y_test, name):
-    logits = np.dot(X_test, w.T) + b
-    y_prob = 1 / (1 + np.exp(-logits))
-    y_prob = np.clip(y_prob, 1e-7, 1 - 1e-7)
-    
-    best_f1, best_t = 0, 0.5
-    for t in np.arange(0.1, 0.9, 0.05):
-        f1 = f1_score(y_test, (y_prob > t).astype(int), zero_division=0)
+def safe_pr_auc(y_true: np.ndarray, y_score: np.ndarray) -> float:
+    if len(np.unique(y_true)) < 2:
+        return float("nan")
+    return float(average_precision_score(y_true, y_score))
+
+
+def tune_threshold(y_true: np.ndarray, y_prob: np.ndarray) -> float:
+    best_threshold = 0.50
+    best_f1 = -1.0
+    for threshold in np.linspace(0.05, 0.95, 91):
+        f1 = f1_score(y_true, y_prob >= threshold, zero_division=0)
         if f1 > best_f1:
-            best_f1, best_t = f1, t
-    
-    y_pred = (y_prob > best_t).astype(int)
-    
+            best_f1 = f1
+            best_threshold = float(threshold)
+    return best_threshold
+
+
+def evaluate_predictions(
+    y_true: np.ndarray, y_prob: np.ndarray, threshold: float
+) -> Dict[str, float]:
+    y_pred = y_prob >= threshold
     return {
-        'name': name,
-        'auc': roc_auc_score(y_test, y_prob),
-        'precision': precision_score(y_test, y_pred, zero_division=0),
-        'recall': recall_score(y_test, y_pred, zero_division=0),
-        'f1': best_f1,
-        'threshold': best_t
+        "roc_auc": safe_roc_auc(y_true, y_prob),
+        "pr_auc": safe_pr_auc(y_true, y_prob),
+        "precision": float(precision_score(y_true, y_pred, zero_division=0)),
+        "recall": float(recall_score(y_true, y_pred, zero_division=0)),
+        "f1": float(f1_score(y_true, y_pred, zero_division=0)),
+        "accuracy": float(accuracy_score(y_true, y_pred)),
+        "threshold": float(threshold),
     }
 
-print("=== STARTING ENHANCED FEDERATED PIPELINE ===")
 
-print("\nLoading data...")
-df_global = load_global_data()
-X_all = df_global.drop('is_fraud', axis=1)
-columns = X_all.columns
+def stratified_or_random_split(
+    df: pd.DataFrame,
+    test_size: float,
+    seed: int,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    stratify = None
+    counts = df[LABEL].value_counts()
+    if len(counts) == 2 and counts.min() >= 2:
+        stratify = df[LABEL]
+    return train_test_split(
+        df,
+        test_size=test_size,
+        random_state=seed,
+        stratify=stratify,
+    )
 
-scaler = StandardScaler()
-scaler.fit(X_all)
-print(f"  Features: {len(columns)}, Samples: {len(df_global)}")
 
-sec_agg = SecureAggregation(CONFIG['byzantine_tolerance'])
-channel = SecureChannel("federated_secret_key_2024")
-dp_accum = 0.0
+def load_bank_frames() -> Dict[str, pd.DataFrame]:
+    missing = [str(path) for path in BANK_FILES.values() if not path.exists()]
+    if missing:
+        raise FileNotFoundError(
+            "Missing bank files. Run gen.py or federated_split.py first: "
+            + ", ".join(missing)
+        )
 
-results_by_model = {}
+    frames = {}
+    for bank_name, path in BANK_FILES.items():
+        df = pd.read_csv(path)
+        if LABEL not in df.columns:
+            raise ValueError(f"{path} does not contain required label column {LABEL!r}")
+        frames[bank_name] = df
+    return frames
 
-for model_type in ['lr', 'rf', 'mlp']:
-    print(f"\n=== Training {model_type.upper()} Model ===")
-    
-    dp_accum = 0.0
-    sec_agg = SecureAggregation(CONFIG['byzantine_tolerance'])
-    
-    for r in range(1, CONFIG['max_rounds'] + 1):
-        dp_accum = federated_round(r, dp_accum, sec_agg, channel, model_type)
-    
-    eval_results = []
-    all_X_test, all_y_test = [], []
-    
-    for name, file_path in [("Bank A", CONFIG['data_path'] + 'bank_A.csv'),
-                          ("Bank B", CONFIG['data_path'] + 'bank_B.csv'),
-                          ("Bank C", CONFIG['data_path'] + 'bank_C.csv')]:
-        X_test, _, y_test, _ = load_bank_data(file_path, columns, scaler)
-        all_X_test.append(X_test)
-        all_y_test.append(y_test)
-        
-        X_train_sample, _, y_train_sample, _ = load_bank_data(file_path, columns, scaler)
-        model = train_local(X_train_sample, y_train_sample, model_type)
-        
-        if model_type == 'lr':
-            y_prob = model.predict_proba(X_test)[:, 1]
+
+def split_bank_frames(
+    bank_frames: Dict[str, pd.DataFrame],
+) -> Dict[str, Dict[str, pd.DataFrame]]:
+    splits: Dict[str, Dict[str, pd.DataFrame]] = {}
+    for offset, (bank_name, frame) in enumerate(bank_frames.items()):
+        train_val, test = stratified_or_random_split(
+            frame,
+            test_size=CONFIG["test_size"],
+            seed=CONFIG["random_seed"] + offset,
+        )
+        val_fraction_of_train_val = CONFIG["validation_size"] / (1 - CONFIG["test_size"])
+        train, val = stratified_or_random_split(
+            train_val,
+            test_size=val_fraction_of_train_val,
+            seed=CONFIG["random_seed"] + 100 + offset,
+        )
+        splits[bank_name] = {
+            "train": train.reset_index(drop=True),
+            "val": val.reset_index(drop=True),
+            "test": test.reset_index(drop=True),
+        }
+    return splits
+
+
+def encode_features(df: pd.DataFrame, feature_columns: Optional[List[str]] = None) -> pd.DataFrame:
+    cleaned = df.drop(columns=[c for c in DROP_COLUMNS if c in df.columns], errors="ignore")
+    encoded = pd.get_dummies(cleaned, drop_first=True)
+    if LABEL not in encoded.columns:
+        raise ValueError(f"Encoded frame is missing label column {LABEL!r}")
+    X = encoded.drop(columns=[LABEL])
+    X = X.apply(pd.to_numeric, errors="coerce").fillna(0)
+    if feature_columns is not None:
+        X = X.reindex(columns=feature_columns, fill_value=0)
+    return X
+
+
+def prepare_datasets() -> Tuple[
+    List[BankDataset],
+    StandardScaler,
+    List[str],
+    Dict[str, object],
+]:
+    bank_frames = load_bank_frames()
+    splits = split_bank_frames(bank_frames)
+
+    train_raw = pd.concat([parts["train"] for parts in splits.values()], ignore_index=True)
+    train_X_raw = encode_features(train_raw)
+    feature_columns = list(train_X_raw.columns)
+
+    scaler = StandardScaler()
+    scaler.fit(train_X_raw.values)
+
+    banks: List[BankDataset] = []
+    for bank_name, parts in splits.items():
+        X_train = scaler.transform(encode_features(parts["train"], feature_columns).values)
+        X_val = scaler.transform(encode_features(parts["val"], feature_columns).values)
+        X_test = scaler.transform(encode_features(parts["test"], feature_columns).values)
+        y_train = parts["train"][LABEL].astype(int).to_numpy()
+        y_val = parts["val"][LABEL].astype(int).to_numpy()
+        y_test = parts["test"][LABEL].astype(int).to_numpy()
+        banks.append(
+            BankDataset(
+                name=bank_name,
+                X_train=X_train,
+                y_train=y_train,
+                X_val=X_val,
+                y_val=y_val,
+                X_test=X_test,
+                y_test=y_test,
+                train_count=len(y_train),
+                fraud_train_count=int(y_train.sum()),
+            )
+        )
+
+    raw_all = pd.concat(bank_frames.values(), ignore_index=True)
+    bank_summary = {}
+    for bank_name, frame in bank_frames.items():
+        bank_summary[bank_name] = {
+            "samples": int(len(frame)),
+            "fraud_cases": int(frame[LABEL].sum()),
+            "fraud_rate": float(frame[LABEL].mean()),
+            "mean_amount": float(frame["amount"].mean()) if "amount" in frame else None,
+        }
+
+    metadata = {
+        "total_samples": int(len(raw_all)),
+        "fraud_cases": int(raw_all[LABEL].sum()),
+        "fraud_rate": float(raw_all[LABEL].mean()),
+        "bank_summary": bank_summary,
+    }
+    return banks, scaler, feature_columns, metadata
+
+
+def combine_split(
+    banks: Iterable[BankDataset],
+    split_name: str,
+) -> Tuple[np.ndarray, np.ndarray]:
+    X_parts = []
+    y_parts = []
+    for bank in banks:
+        X_parts.append(getattr(bank, f"X_{split_name}"))
+        y_parts.append(getattr(bank, f"y_{split_name}"))
+    return np.vstack(X_parts), np.concatenate(y_parts)
+
+
+def positive_class_weight(y: np.ndarray) -> float:
+    positives = max(int(y.sum()), 1)
+    negatives = max(len(y) - positives, 1)
+    return float(min(negatives / positives, 40.0))
+
+
+def fit_logistic(
+    X: np.ndarray,
+    y: np.ndarray,
+    epochs: int,
+    learning_rate: float,
+    rng: np.random.Generator,
+    initial: Optional[Tuple[np.ndarray, float]] = None,
+) -> Tuple[np.ndarray, float]:
+    n_samples, n_features = X.shape
+    if initial is None:
+        weights = np.zeros(n_features, dtype=float)
+        bias = 0.0
+    else:
+        weights = initial[0].copy()
+        bias = float(initial[1])
+
+    pos_weight = positive_class_weight(y)
+    batch_size = min(CONFIG["batch_size"], n_samples)
+
+    for _ in range(epochs):
+        order = rng.permutation(n_samples)
+        for start in range(0, n_samples, batch_size):
+            batch_idx = order[start : start + batch_size]
+            X_batch = X[batch_idx]
+            y_batch = y[batch_idx]
+            y_prob = predict_probability(weights, bias, X_batch)
+            sample_weight = np.where(y_batch == 1, pos_weight, 1.0)
+            error = (y_prob - y_batch) * sample_weight
+            denom = max(float(sample_weight.sum()), 1.0)
+            grad_w = X_batch.T @ error / denom + CONFIG["l2"] * weights
+            grad_b = float(error.sum() / denom)
+            weights -= learning_rate * grad_w
+            bias -= learning_rate * grad_b
+    return weights, bias
+
+
+def clip_update(
+    delta_w: np.ndarray,
+    delta_b: float,
+    clip_norm: float,
+) -> Tuple[np.ndarray, float, float]:
+    flat = np.concatenate([delta_w.ravel(), np.array([delta_b])])
+    norm = float(np.linalg.norm(flat))
+    if norm > clip_norm:
+        scale = clip_norm / max(norm, 1e-12)
+        return delta_w * scale, float(delta_b * scale), norm
+    return delta_w, float(delta_b), norm
+
+
+def aggregate_updates(
+    updates: List[Tuple[np.ndarray, float, int]],
+    method: str,
+) -> Tuple[np.ndarray, float]:
+    delta_w = np.vstack([u[0] for u in updates])
+    delta_b = np.array([u[1] for u in updates], dtype=float)
+    sample_counts = np.array([u[2] for u in updates], dtype=float)
+
+    if method == "mean":
+        weights = sample_counts / sample_counts.sum()
+        return weights @ delta_w, float(weights @ delta_b)
+
+    if method == "median":
+        return np.median(delta_w, axis=0), float(np.median(delta_b))
+
+    if method == "trimmed_mean":
+        if len(updates) <= 2:
+            return np.mean(delta_w, axis=0), float(np.mean(delta_b))
+        sorted_w = np.sort(delta_w, axis=0)
+        sorted_b = np.sort(delta_b)
+        return np.mean(sorted_w[1:-1], axis=0), float(np.mean(sorted_b[1:-1]))
+
+    raise ValueError(f"Unknown aggregation method: {method}")
+
+
+def approximate_epsilon_per_round(noise_multiplier: float, delta: float) -> float:
+    if noise_multiplier <= 0:
+        return float("inf")
+    return float(np.sqrt(2 * np.log(1.25 / delta)) / noise_multiplier)
+
+
+def train_federated(
+    banks: List[BankDataset],
+    aggregation: str,
+    use_dp: bool,
+    rng: np.random.Generator,
+    attack_client: Optional[str] = None,
+) -> Tuple[np.ndarray, float, List[Dict[str, float]]]:
+    n_features = banks[0].X_train.shape[1]
+    global_w = np.zeros(n_features, dtype=float)
+    global_b = 0.0
+    history: List[Dict[str, float]] = []
+
+    X_val, y_val = combine_split(banks, "val")
+    attack_rounds = set(
+        range(CONFIG["attack_round_start"], CONFIG["attack_round_end"] + 1)
+    )
+
+    for round_num in range(1, CONFIG["federated_rounds"] + 1):
+        updates: List[Tuple[np.ndarray, float, int]] = []
+        norms = []
+        attacked_this_round = False
+
+        for bank in banks:
+            local_w, local_b = fit_logistic(
+                bank.X_train,
+                bank.y_train,
+                epochs=CONFIG["local_epochs"],
+                learning_rate=CONFIG["learning_rate"],
+                rng=rng,
+                initial=(global_w, global_b),
+            )
+            delta_w = local_w - global_w
+            delta_b = local_b - global_b
+            delta_w, delta_b, raw_norm = clip_update(
+                delta_w,
+                delta_b,
+                CONFIG["clip_norm"],
+            )
+            norms.append(raw_norm)
+
+            if attack_client == bank.name and round_num in attack_rounds:
+                delta_w = -CONFIG["attack_scale"] * delta_w
+                delta_b = -CONFIG["attack_scale"] * delta_b
+                attacked_this_round = True
+
+            updates.append((delta_w, delta_b, bank.train_count))
+
+        agg_w, agg_b = aggregate_updates(updates, aggregation)
+
+        if use_dp:
+            noise_std = CONFIG["noise_multiplier"] * CONFIG["clip_norm"] / len(banks)
+            agg_w = agg_w + rng.normal(0, noise_std, size=agg_w.shape)
+            agg_b = float(agg_b + rng.normal(0, noise_std))
+
+        global_w += CONFIG["server_learning_rate"] * agg_w
+        global_b += CONFIG["server_learning_rate"] * agg_b
+
+        val_prob = predict_probability(global_w, global_b, X_val)
+        threshold = tune_threshold(y_val, val_prob)
+        val_metrics = evaluate_predictions(y_val, val_prob, threshold)
+        history.append(
+            {
+                "round": round_num,
+                "val_pr_auc": val_metrics["pr_auc"],
+                "val_f1": val_metrics["f1"],
+                "mean_update_norm": float(np.mean(norms)),
+                "attacked": bool(attacked_this_round),
+            }
+        )
+
+    return global_w, global_b, history
+
+
+def evaluate_model(
+    weights: np.ndarray,
+    bias: float,
+    banks: List[BankDataset],
+) -> Tuple[Dict[str, float], Dict[str, Dict[str, float]]]:
+    X_val, y_val = combine_split(banks, "val")
+    X_test, y_test = combine_split(banks, "test")
+
+    val_prob = predict_probability(weights, bias, X_val)
+    threshold = tune_threshold(y_val, val_prob)
+
+    test_prob = predict_probability(weights, bias, X_test)
+    overall = evaluate_predictions(y_test, test_prob, threshold)
+
+    per_bank = {}
+    for bank in banks:
+        bank_prob = predict_probability(weights, bias, bank.X_test)
+        per_bank[bank.name] = evaluate_predictions(bank.y_test, bank_prob, threshold)
+    return overall, per_bank
+
+
+def evaluate_local_only(
+    banks: List[BankDataset],
+    rng: np.random.Generator,
+) -> Tuple[Dict[str, float], Dict[str, Dict[str, float]]]:
+    per_bank = {}
+    metric_rows = []
+
+    for bank in banks:
+        weights, bias = fit_logistic(
+            bank.X_train,
+            bank.y_train,
+            epochs=80,
+            learning_rate=CONFIG["learning_rate"],
+            rng=rng,
+        )
+        val_prob = predict_probability(weights, bias, bank.X_val)
+        threshold = tune_threshold(bank.y_val, val_prob)
+        test_prob = predict_probability(weights, bias, bank.X_test)
+        metrics = evaluate_predictions(bank.y_test, test_prob, threshold)
+        per_bank[bank.name] = metrics
+        metric_rows.append(metrics)
+
+    overall = {
+        metric: float(np.nanmean([row[metric] for row in metric_rows]))
+        for metric in [
+            "roc_auc",
+            "pr_auc",
+            "precision",
+            "recall",
+            "f1",
+            "accuracy",
+            "threshold",
+        ]
+    }
+    return overall, per_bank
+
+
+def oversample_minority(
+    X: np.ndarray,
+    y: np.ndarray,
+    rng: np.random.Generator,
+    target_positive_ratio: float = 0.35,
+) -> Tuple[np.ndarray, np.ndarray]:
+    positive_idx = np.flatnonzero(y == 1)
+    negative_idx = np.flatnonzero(y == 0)
+    if len(positive_idx) == 0 or len(negative_idx) == 0:
+        return X, y
+
+    target_positive_count = int(
+        target_positive_ratio * len(negative_idx) / max(1 - target_positive_ratio, 1e-6)
+    )
+    extra_count = max(0, target_positive_count - len(positive_idx))
+    sampled_extra = rng.choice(positive_idx, size=extra_count, replace=True)
+    balanced_idx = np.concatenate([negative_idx, positive_idx, sampled_extra])
+    rng.shuffle(balanced_idx)
+    return X[balanced_idx], y[balanced_idx]
+
+
+def evaluate_probability_model(
+    model,
+    banks: List[BankDataset],
+) -> Tuple[Dict[str, float], Dict[str, Dict[str, float]]]:
+    X_val, y_val = combine_split(banks, "val")
+    X_test, y_test = combine_split(banks, "test")
+
+    val_prob = model.predict_proba(X_val)[:, 1]
+    threshold = tune_threshold(y_val, val_prob)
+    test_prob = model.predict_proba(X_test)[:, 1]
+    overall = evaluate_predictions(y_test, test_prob, threshold)
+
+    per_bank = {}
+    for bank in banks:
+        bank_prob = model.predict_proba(bank.X_test)[:, 1]
+        per_bank[bank.name] = evaluate_predictions(bank.y_test, bank_prob, threshold)
+    return overall, per_bank
+
+
+def train_traditional_ml_baselines(
+    banks: List[BankDataset],
+    rng: np.random.Generator,
+) -> Tuple[
+    Dict[str, Dict[str, float]],
+    Dict[str, Dict[str, Dict[str, float]]],
+    Dict[str, object],
+]:
+    X_train, y_train = combine_split(banks, "train")
+    X_balanced, y_balanced = oversample_minority(X_train, y_train, rng)
+
+    models = {
+        "ml_lr": SklearnLogisticRegression(
+            max_iter=2000,
+            class_weight="balanced",
+            solver="liblinear",
+            random_state=CONFIG["random_seed"],
+        ),
+        "ml_rf": RandomForestClassifier(
+            n_estimators=240,
+            max_depth=9,
+            min_samples_leaf=4,
+            class_weight="balanced_subsample",
+            random_state=CONFIG["random_seed"],
+            n_jobs=-1,
+        ),
+        "ml_mlp": MLPClassifier(
+            hidden_layer_sizes=(48, 24),
+            activation="relu",
+            alpha=1e-4,
+            max_iter=450,
+            early_stopping=True,
+            random_state=CONFIG["random_seed"],
+        ),
+    }
+
+    metrics = {}
+    per_bank_results = {}
+    fitted_models = {}
+    for name, model in models.items():
+        if name == "ml_mlp":
+            model.fit(X_balanced, y_balanced)
         else:
-            y_prob = model.predict_proba(X_test)[:, 1]
-        
-        best_f1, best_t = 0, 0.5
-        for t in np.arange(0.1, 0.9, 0.05):
-            f1 = f1_score(y_test, (y_prob > t).astype(int), zero_division=0)
-            if f1 > best_f1:
-                best_f1, best_t = f1, t
-        y_pred = (y_prob > best_t).astype(int)
-        eval_results.append({
-            'name': name,
-            'auc': roc_auc_score(y_test, y_prob),
-            'precision': precision_score(y_test, y_pred, zero_division=0),
-            'recall': recall_score(y_test, y_pred, zero_division=0),
-            'f1': best_f1,
-            'threshold': best_t
-        })
-    
-    X_all_test = np.vstack(all_X_test)
-    y_all_test = np.concatenate(all_y_test)
-    
-    model = train_local(all_X_test[0], all_y_test[0], model_type)
-    y_prob = model.predict_proba(X_all_test)[:, 1]
-    best_f1, best_t = 0, 0.5
-    for t in np.arange(0.1, 0.9, 0.05):
-        f1 = f1_score(y_all_test, (y_prob > t).astype(int), zero_division=0)
-        if f1 > best_f1:
-            best_f1, best_t = f1, t
-    y_pred = (y_prob > best_t).astype(int)
-    eval_results.append({
-        'name': 'ALL',
-        'auc': roc_auc_score(y_all_test, y_prob),
-        'precision': precision_score(y_all_test, y_pred, zero_division=0),
-        'recall': recall_score(y_all_test, y_pred, zero_division=0),
-        'f1': best_f1,
-        'threshold': best_t
-    })
-    
-    results_by_model[model_type] = {'results': eval_results, 'model_type': model_type}
-    print(f"\n  {model_type.upper()} - AUC: {eval_results[-1]['auc']:.4f}, F1: {eval_results[-1]['f1']:.4f}")
+            model.fit(X_train, y_train)
+        overall, per_bank = evaluate_probability_model(model, banks)
+        metrics[name] = make_model_summary(overall)
+        per_bank_results[name] = per_bank
+        fitted_models[name] = model
 
-best_model = max(results_by_model.keys(), 
-           key=lambda k: results_by_model[k]['results'][-1]['auc'])
+    return metrics, per_bank_results, fitted_models
 
-print(f"\n*** BEST MODEL: {best_model.upper()} ***")
 
-def plot_comparison():
-    plt.figure(figsize=(10, 8))
-    colors = {'lr': '#FF6B6B', 'rf': '#4ECDC4', 'mlp': '#45B7D1'}
-    
-    all_X_test, all_y_test = [], []
-    for name, file_path in [("Bank A", CONFIG['data_path'] + 'bank_A.csv'),
-                          ("Bank B", CONFIG['data_path'] + 'bank_B.csv'),
-                          ("Bank C", CONFIG['data_path'] + 'bank_C.csv')]:
-        X_test, _, y_test, _ = load_bank_data(file_path, columns, scaler)
-        all_X_test.append(X_test)
-        all_y_test.append(y_test)
-    
-    X_all_test = np.vstack(all_X_test)
-    y_all_test = np.concatenate(all_y_test)
-    
-    for model_type, data in results_by_model.items():
-        if model_type == 'lr':
-            X_train_sample = all_X_test[0]
-            y_train_sample = all_y_test[0]
-        else:
-            X_train_sample = all_X_test[0]
-            y_train_sample = all_y_test[0]
-        
-        model = train_local(X_train_sample, y_train_sample, model_type)
-        y_prob = model.predict_proba(X_all_test)[:, 1]
-        fpr, tpr, _ = roc_curve(y_all_test, y_prob)
-        auc = roc_auc_score(y_all_test, y_prob)
-        plt.plot(fpr, tpr, label=f'{model_type.upper()} (AUC={auc:.3f})', 
-                 color=colors[model_type], linewidth=2)
-    
-    plt.plot([0, 1], [0, 1], 'k--', alpha=0.5)
-    plt.xlabel('False Positive Rate', fontsize=12)
-    plt.ylabel('True Positive Rate', fontsize=12)
-    plt.title('ROC Curves - Model Comparison', fontsize=14)
-    plt.legend(loc='lower right')
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig('model_comparison.png', dpi=150)
-    plt.show()
+def make_model_summary(metrics: Dict[str, float]) -> Dict[str, float]:
+    return {
+        "auc": metrics["roc_auc"],
+        "roc_auc": metrics["roc_auc"],
+        "pr_auc": metrics["pr_auc"],
+        "precision": metrics["precision"],
+        "recall": metrics["recall"],
+        "f1": metrics["f1"],
+        "accuracy": metrics["accuracy"],
+        "threshold": metrics["threshold"],
+    }
 
-def plot_privacy():
-    rounds = list(range(1, CONFIG['max_rounds'] + 1))
-    epsilon = [r * CONFIG['epsilon'] for r in rounds]
-    
-    plt.figure(figsize=(10, 5))
-    plt.plot(rounds, epsilon, marker='o', linewidth=2, color='#FF6B6B')
-    plt.axhline(y=CONFIG['epsilon'] * CONFIG['max_rounds'], color='gray', linestyle='--', label='Max Budget')
-    plt.xlabel('Federated Round', fontsize=12)
-    plt.ylabel('Cumulative epsilon', fontsize=12)
-    plt.title('Privacy Budget Consumption', fontsize=14)
-    plt.grid(True, alpha=0.3)
+
+def plot_model_comparison(model_comparison: Dict[str, Dict[str, float]]) -> None:
+    names = list(model_comparison.keys())
+    pr_auc = [model_comparison[name]["pr_auc"] for name in names]
+    f1 = [model_comparison[name]["f1"] for name in names]
+
+    x = np.arange(len(names))
+    width = 0.36
+    plt.figure(figsize=(12, 6))
+    plt.bar(x - width / 2, pr_auc, width, label="PR-AUC", color="#2F80ED")
+    plt.bar(x + width / 2, f1, width, label="F1", color="#27AE60")
+    plt.xticks(x, [name.replace("_", "\n") for name in names], fontsize=9)
+    plt.ylim(0, 1.05)
+    plt.ylabel("Score")
+    plt.title("Federated Fraud Detection: Imbalanced-Data Model Comparison")
+    plt.grid(axis="y", alpha=0.25)
     plt.legend()
     plt.tight_layout()
-    plt.savefig('privacy_budget.png', dpi=150)
-    plt.show()
+    plt.savefig(BASE_DIR / "model_comparison.png", dpi=160)
+    plt.close()
 
-plot_comparison()
-plot_privacy()
 
-output = {
-    'configuration': CONFIG,
-    'model_comparison': {k: {'auc': v['results'][-1]['auc'], 'f1': v['results'][-1]['f1']} 
-                      for k, v in results_by_model.items()},
-    'best_model': best_model,
-    'privacy_budget': {
-        'total_epsilon_spent': dp_accum,
-        'max_rounds': CONFIG['max_rounds']
-    },
-    'unique_features': [
-        'Differential Privacy (Gaussian)',
-        'Secure Aggregation + Signatures',
-        'Multi-model Comparison (LR/RF/MLP)',
-        'Per-Bank Evaluation'
+def plot_privacy_budget() -> None:
+    rounds = np.arange(1, CONFIG["federated_rounds"] + 1)
+    eps_per_round = approximate_epsilon_per_round(
+        CONFIG["noise_multiplier"], CONFIG["delta"]
+    )
+    epsilon = eps_per_round * rounds
+    plt.figure(figsize=(9, 4.8))
+    plt.plot(rounds, epsilon, marker="o", color="#9B51E0", linewidth=2)
+    plt.xlabel("Federated Round")
+    plt.ylabel("Approximate cumulative epsilon")
+    plt.title("Privacy Budget Tracking")
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(BASE_DIR / "privacy_budget.png", dpi=160)
+    plt.close()
+
+
+def plot_per_bank_f1(per_bank_metrics: Dict[str, Dict[str, float]]) -> None:
+    names = list(per_bank_metrics.keys())
+    f1_scores = [per_bank_metrics[name]["f1"] for name in names]
+    recalls = [per_bank_metrics[name]["recall"] for name in names]
+
+    x = np.arange(len(names))
+    width = 0.36
+    plt.figure(figsize=(8, 4.8))
+    plt.bar(x - width / 2, f1_scores, width, label="F1", color="#EB5757")
+    plt.bar(x + width / 2, recalls, width, label="Recall", color="#F2C94C")
+    plt.xticks(x, names)
+    plt.ylim(0, 1.05)
+    plt.ylabel("Score")
+    plt.title("Per-Bank Test Performance")
+    plt.grid(axis="y", alpha=0.25)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(BASE_DIR / "per_bank_f1.png", dpi=160)
+    plt.close()
+
+
+def to_jsonable(value):
+    if isinstance(value, dict):
+        return {k: to_jsonable(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [to_jsonable(v) for v in value]
+    if isinstance(value, tuple):
+        return [to_jsonable(v) for v in value]
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, (np.integer, np.floating)):
+        return value.item()
+    if isinstance(value, float) and (np.isnan(value) or np.isinf(value)):
+        return None
+    return value
+
+
+def main() -> None:
+    rng = np.random.default_rng(CONFIG["random_seed"])
+    banks, scaler, feature_columns, dataset_metadata = prepare_datasets()
+    X_train, y_train = combine_split(banks, "train")
+
+    print("=== Federated UPI Fraud Detection ===")
+    print(f"Samples: {dataset_metadata['total_samples']}")
+    print(f"Fraud rate: {dataset_metadata['fraud_rate']:.3%}")
+    print(f"Features: {len(feature_columns)}")
+
+    trained_models: Dict[str, object] = {}
+    model_metrics: Dict[str, Dict[str, float]] = {}
+    per_bank_results: Dict[str, Dict[str, Dict[str, float]]] = {}
+    training_history: Dict[str, List[Dict[str, float]]] = {}
+
+    print("\nTraining centralized baseline...")
+    central_w, central_b = fit_logistic(
+        X_train,
+        y_train,
+        epochs=90,
+        learning_rate=CONFIG["learning_rate"],
+        rng=rng,
+    )
+    central_metrics, central_per_bank = evaluate_model(central_w, central_b, banks)
+    trained_models["centralized"] = (central_w, central_b)
+    model_metrics["centralized"] = make_model_summary(central_metrics)
+    per_bank_results["centralized"] = central_per_bank
+
+    print("Training local-only baselines...")
+    local_metrics, local_per_bank = evaluate_local_only(banks, rng)
+    model_metrics["local_only_avg"] = make_model_summary(local_metrics)
+    per_bank_results["local_only_avg"] = local_per_bank
+
+    print("Training traditional ML baselines (LR/RF/MLP)...")
+    ml_metrics, ml_per_bank, ml_models = train_traditional_ml_baselines(banks, rng)
+    model_metrics.update(ml_metrics)
+    per_bank_results.update(ml_per_bank)
+    trained_models.update(ml_models)
+
+    experiments = [
+        ("fedavg_mean", "mean", False, None),
+        ("dp_fedavg_mean", "mean", True, None),
+        ("robust_dp_median", "median", True, None),
+        ("dp_mean_attack", "mean", True, CONFIG["attack_client"]),
+        ("robust_dp_median_attack", "median", True, CONFIG["attack_client"]),
     ]
-}
 
-best_model_type = results_by_model[best_model]['model_type']
-X_train_all = scaler.transform(X_all.values)
+    for name, aggregation, use_dp, attack_client in experiments:
+        attack_note = f", attack={attack_client}" if attack_client else ""
+        print(f"Training {name} (aggregation={aggregation}, dp={use_dp}{attack_note})...")
+        weights, bias, history = train_federated(
+            banks,
+            aggregation=aggregation,
+            use_dp=use_dp,
+            rng=rng,
+            attack_client=attack_client,
+        )
+        overall, per_bank = evaluate_model(weights, bias, banks)
+        trained_models[name] = (weights, bias)
+        model_metrics[name] = make_model_summary(overall)
+        per_bank_results[name] = per_bank
+        training_history[name] = history
 
-model_final = train_local(X_train_all, df_global['is_fraud'].values, best_model_type)
+    best_overall_model = max(
+        model_metrics.keys(),
+        key=lambda key: model_metrics[key]["auc"],
+    )
+    classical_candidates = [name for name in ["ml_lr", "ml_rf", "ml_mlp"] if name in model_metrics]
+    best_classical_model = max(
+        classical_candidates,
+        key=lambda key: model_metrics[key]["auc"],
+    )
+    federated_candidates = ["fedavg_mean", "dp_fedavg_mean", "robust_dp_median"]
+    best_federated_model = max(
+        federated_candidates,
+        key=lambda key: model_metrics[key]["auc"],
+    )
+    private_candidates = ["dp_fedavg_mean", "robust_dp_median"]
+    recommended_private_model = max(
+        private_candidates,
+        key=lambda key: (model_metrics[key]["f1"], model_metrics[key]["pr_auc"]),
+    )
+    print(f"\nBest overall by AUC: {best_overall_model}")
+    print(f"Recommended privacy-preserving model: {recommended_private_model}")
+    print(
+        "Test PR-AUC={:.4f}, F1={:.4f}, Recall={:.4f}".format(
+            model_metrics[recommended_private_model]["pr_auc"],
+            model_metrics[recommended_private_model]["f1"],
+            model_metrics[recommended_private_model]["recall"],
+        )
+    )
 
-import pickle
-with open('model.pkl', 'wb') as f:
-    pickle.dump(model_final, f)
-with open('scaler.pkl', 'wb') as f:
-    pickle.dump(scaler, f)
+    eps_per_round = approximate_epsilon_per_round(
+        CONFIG["noise_multiplier"], CONFIG["delta"]
+    )
+    privacy_budget = {
+        "accountant": "basic Gaussian composition approximation",
+        "delta": CONFIG["delta"],
+        "noise_multiplier": CONFIG["noise_multiplier"],
+        "clip_norm": CONFIG["clip_norm"],
+        "epsilon_per_round": eps_per_round,
+        "total_epsilon_spent": eps_per_round * CONFIG["federated_rounds"],
+        "max_rounds": CONFIG["federated_rounds"],
+    }
 
-print("Model saved!")
+    output = {
+        "configuration": CONFIG,
+        "dataset": dataset_metadata,
+        "model_comparison": model_metrics,
+        "best_model": recommended_private_model,
+        "active_prediction_model": best_overall_model,
+        "best_overall_model": best_overall_model,
+        "best_classical_model": best_classical_model,
+        "best_federated_model": best_federated_model,
+        "recommended_private_model": recommended_private_model,
+        "best_model_note": "best_model is the recommended privacy-preserving DP federated model, selected by F1 then PR-AUC among non-attack DP models. It is not necessarily the highest-AUC model overall.",
+        "privacy_budget": privacy_budget,
+        "per_bank_evaluation": per_bank_results[recommended_private_model],
+        "robustness": {
+            "attack_client": CONFIG["attack_client"],
+            "attack_rounds": [
+                CONFIG["attack_round_start"],
+                CONFIG["attack_round_end"],
+            ],
+            "attack_scale": CONFIG["attack_scale"],
+            "mean_under_attack": model_metrics["dp_mean_attack"],
+            "median_under_attack": model_metrics["robust_dp_median_attack"],
+        },
+        "training_history": training_history,
+        "unique_features": [
+            "Traditional ML baselines: LR, RF, and MLP",
+            "Non-IID bank simulation",
+            "FedAvg with held-out validation thresholding",
+            "Differentially private clipped update aggregation",
+            "Byzantine attack simulation",
+            "Coordinate-wise median robust aggregation",
+            "PR-AUC reporting for imbalanced fraud detection",
+        ],
+    }
 
-with open('results.json', 'w') as f:
-    json.dump(output, f, indent=2)
+    plot_model_comparison(model_metrics)
+    plot_privacy_budget()
+    plot_per_bank_f1(per_bank_results[best_overall_model])
 
-print("\n=== PIPELINE COMPLETE ===")
-print("Results: results.json")
-print("Charts: model_comparison.png, privacy_budget.png")
+    active_model = trained_models[best_overall_model]
+    if isinstance(active_model, tuple):
+        active_w, active_b = active_model
+        model_artifact = {
+            "model_type": "federated_logistic_regression",
+            "active_model": best_overall_model,
+            "recommended_private_model": recommended_private_model,
+            "weights": active_w,
+            "bias": float(active_b),
+            "feature_columns": feature_columns,
+            "threshold": model_metrics[best_overall_model]["threshold"],
+            "metrics": model_metrics[best_overall_model],
+        }
+    else:
+        model_artifact = {
+            "model_type": "sklearn_probability_model",
+            "active_model": best_overall_model,
+            "recommended_private_model": recommended_private_model,
+            "estimator": active_model,
+            "feature_columns": feature_columns,
+            "threshold": model_metrics[best_overall_model]["threshold"],
+            "metrics": model_metrics[best_overall_model],
+        }
+
+    with open(BASE_DIR / "model.pkl", "wb") as f:
+        pickle.dump(model_artifact, f)
+    with open(BASE_DIR / "scaler.pkl", "wb") as f:
+        pickle.dump(scaler, f)
+    with open(BASE_DIR / "results.json", "w", encoding="utf-8") as f:
+        json.dump(to_jsonable(output), f, indent=2)
+
+    print("\nSaved:")
+    print("  model.pkl")
+    print("  scaler.pkl")
+    print("  results.json")
+    print("  model_comparison.png")
+    print("  privacy_budget.png")
+    print("  per_bank_f1.png")
+
+
+if __name__ == "__main__":
+    main()

@@ -13,7 +13,7 @@ from sklearn.metrics import classification_report, confusion_matrix, roc_auc_sco
 from imblearn.over_sampling import SMOTE
 
 # ========== 2. LOAD DATA ==========
-df = pd.read_csv("upi_synthetic_dataset.csv")
+df = pd.read_csv("data/upi_synthetic_dataset.csv")
 
 print("Dataset Loaded ✅")
 print(df.head())
@@ -25,7 +25,7 @@ print("\nClass Distribution:\n", df["is_fraud"].value_counts())
 df = pd.get_dummies(df, columns=["device_type", "upi_app", "location"], drop_first=True)
 
 # Drop unnecessary columns
-df = df.drop(["transaction_id", "timestamp", "utr_number"], axis=1)
+df = df.drop(["transaction_id", "timestamp", "utr_number", "bank_id"], axis=1, errors="ignore")
 
 # Split features & label
 X = df.drop("is_fraud", axis=1)

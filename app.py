@@ -304,11 +304,81 @@ results = load_results()
 model, scaler = load_model()
 df_data = load_data()
 
+DEFAULT_FEATURE_COLS = [
+    'amount', 'sender_id', 'receiver_id', 'hour', 'is_weekend', 'is_night',
+    'transaction_velocity', 'account_age_days', 'receiver_age_days',
+    'is_new_receiver', 'failed_attempts_24h', 'device_type_web',
+    'upi_app_GPay', 'upi_app_Paytm', 'upi_app_PhonePe',
+    'location_Chennai', 'location_Delhi', 'location_Hyderabad',
+    'location_Mumbai', 'location_Pune'
+]
+
+
+def get_feature_columns():
+    if isinstance(model, dict) and model.get("feature_columns"):
+        return model["feature_columns"]
+    return DEFAULT_FEATURE_COLS
+
+
+MODEL_DISPLAY_NAMES = {
+    "ml_lr": "LR",
+    "ml_rf": "RF",
+    "ml_mlp": "MLP",
+    "centralized": "Centralized",
+    "local_only_avg": "Local Only",
+    "fedavg_mean": "FedAvg",
+    "dp_fedavg_mean": "DP-FedAvg",
+    "robust_dp_median": "Robust DP-FedAvg",
+    "dp_mean_attack": "DP-FedAvg Attack",
+    "robust_dp_median_attack": "Robust Attack",
+}
+
+
+def display_model_name(model_name):
+    return MODEL_DISPLAY_NAMES.get(model_name, model_name.replace("_", " ").title())
+
+
+def predict_model_probability(feature_dict):
+    if model is None or scaler is None:
+        raise RuntimeError("Model or scaler is not available")
+
+    feature_cols = get_feature_columns()
+    X = pd.DataFrame([feature_dict]).reindex(columns=feature_cols, fill_value=0)
+    X_scaled = scaler.transform(X.values)
+
+    if isinstance(model, dict) and model.get("model_type") == "federated_logistic_regression":
+        weights = np.asarray(model["weights"], dtype=float)
+        bias = float(model["bias"])
+        logits = np.dot(X_scaled, weights) + bias
+        return float(1 / (1 + np.exp(-np.clip(logits[0], -40, 40))))
+
+    if isinstance(model, dict) and model.get("model_type") == "sklearn_probability_model":
+        estimator = model["estimator"]
+        return float(estimator.predict_proba(X_scaled)[0, 1])
+
+    return float(model.predict_proba(X_scaled)[0, 1])
+
 if not results:
     st.error("No results found. Please run main.py first.")
     st.stop()
 
-best = results.get('best_model', 'lr').upper()
+model_metrics = results.get("model_comparison", {})
+recommended_private = results.get("recommended_private_model", results.get("best_model"))
+best_overall = results.get("best_overall_model")
+if not best_overall and model_metrics:
+    best_overall = max(
+        model_metrics,
+        key=lambda name: model_metrics[name].get("auc", model_metrics[name].get("roc_auc", 0))
+    )
+best_federated = results.get("best_federated_model")
+if not best_federated and model_metrics:
+    federated_names = [name for name in ["fedavg_mean", "dp_fedavg_mean", "robust_dp_median"] if name in model_metrics]
+    if federated_names:
+        best_federated = max(
+            federated_names,
+            key=lambda name: model_metrics[name].get("auc", model_metrics[name].get("roc_auc", 0))
+        )
+active_prediction_model = results.get("active_prediction_model", best_overall)
 
 # =========================================
 # DASHBOARD PAGE
@@ -318,20 +388,28 @@ if page == "Dashboard":
     
     st.title("Federated Fraud Detection System")
     st.markdown("### Privacy-Preserving UPI Fraud Detection with Differential Privacy")
-    st.success(f"Active Model: **{best}** (Best performing model - AUC-based selection)")
+    st.success(
+        f"Active Prediction Model: **{display_model_name(active_prediction_model)}** "
+        "(best performing model by AUC)"
+    )
     privacy = results.get("privacy_budget", {})
     
-    st.markdown('<p class="section-header">Model Performance Comparison</p>', unsafe_allow_html=True)
+    st.markdown('<p class="section-header">Top 3 Best Performing Models</p>', unsafe_allow_html=True)
     
     cols = st.columns(3)
-    model_metrics = results.get("model_comparison", {})
+    top_models = sorted(
+        model_metrics.items(),
+        key=lambda item: item[1].get("auc", item[1].get("roc_auc", 0)),
+        reverse=True
+    )[:3]
     
-    for i, (model_name, metrics) in enumerate(model_metrics.items()):
+    for i, (model_name, metrics) in enumerate(top_models):
         with cols[i]:
+            pr_auc = metrics.get('pr_auc', 0)
             st.metric(
-                f"{model_name.upper()} Model",
+                f"Rank {i + 1}: {display_model_name(model_name)}",
                 f"AUC: {metrics['auc']:.4f}",
-                f"F1: {metrics['f1']:.4f}"
+                f"F1: {metrics['f1']:.4f} | PR-AUC: {pr_auc:.4f}"
             )
     
     st.markdown('<p class="section-header">Time-Series Fraud Trends</p>', unsafe_allow_html=True)
@@ -347,7 +425,7 @@ if page == "Dashboard":
     end_dt = pd.to_datetime(end_date)
     seed_value = int(start_date.toordinal()) + int(end_date.toordinal())
     np.random.seed(seed_value)
-    dates = pd.date_range(start=start_dt, end=end_dt, freq='1h')
+    dates = pd.date_range(start=start_dt, end=end_dt, freq='H')
     n_hours = len(dates)
     
     seasonal_factor = 1 + 0.3 * np.sin(2 * np.pi * dates.dayofyear / 365)
@@ -547,9 +625,9 @@ if page == "Dashboard":
     <div style='padding: 20px; background: {colors['card']}; border-radius: 12px; border-left: 4px solid {colors['primary']};'>
     <p style='font-size: 16px; color: {colors['text']};'><strong>1. Local Training:</strong> Each bank trains a model locally on its own data - raw data never leaves the bank.</p>
     <p style='font-size: 16px; color: {colors['text']}; margin-top: 12px;'><strong>2. Weight Sharing:</strong> Only model weights (not data) are shared with the central server.</p>
-    <p style='font-size: 16px; color: {colors['text']}; margin-top: 12px;'><strong>3. Differential Privacy:</strong> Gaussian noise is added to prevent reconstructing original data.</p>
-    <p style='font-size: 16px; color: {colors['text']}; margin-top: 12px;'><strong>4. Secure Aggregation:</strong> Server combines weights using FedAvg - individual models remain private.</p>
-    <p style='font-size: 16px; color: {colors['text']}; margin-top: 12px;'><strong>5. Privacy Budget:</strong> Every round consumes epsilon - tracks total privacy spent.</p>
+    <p style='font-size: 16px; color: {colors['text']}; margin-top: 12px;'><strong>3. Differential Privacy:</strong> Client updates are clipped and Gaussian noise is added before the global update is applied.</p>
+    <p style='font-size: 16px; color: {colors['text']}; margin-top: 12px;'><strong>4. Robust Aggregation:</strong> FedAvg and coordinate-wise median aggregation are compared under a Byzantine client attack.</p>
+    <p style='font-size: 16px; color: {colors['text']}; margin-top: 12px;'><strong>5. Privacy Budget:</strong> The experiment tracks approximate cumulative epsilon across federated rounds.</p>
     </div>
     """, unsafe_allow_html=True)
     
@@ -582,7 +660,7 @@ if page == "Dashboard":
         """, unsafe_allow_html=True)
     
     if os.path.exists("model_comparison.png"):
-        st.markdown('<p class="section-header">ROC Curves - Model Comparison</p>', unsafe_allow_html=True)
+        st.markdown('<p class="section-header">Model Comparison - PR-AUC and F1</p>', unsafe_allow_html=True)
         st.image("model_comparison.png", use_container_width=True)
 
 # =========================================
@@ -664,30 +742,31 @@ elif page == "Live Prediction":
         location = st.selectbox("Location", ["Mumbai", "Delhi", "Chennai", "Bangalore"])
     
     if st.button("Predict Fraud Risk", type="primary"):
-        feature_cols = ['amount', 'sender_id', 'receiver_id', 'is_night', 'transaction_velocity',
-                             'device_type_web', 'upi_app_Paytm', 'upi_app_PhonePe',
-                             'location_Chennai', 'location_Delhi', 'location_Mumbai']
-        
+        hour = 23 if is_night else 14
         feature_dict = {
-            'amount': amount / 10000,
-            'sender_id': np.random.randint(1000, 9999),
-            'receiver_id': np.random.randint(1000, 9999),
+            'amount': amount,
+            'sender_id': np.random.randint(10000, 25000),
+            'receiver_id': np.random.randint(25000, 42000),
+            'hour': hour,
+            'is_weekend': 0,
             'is_night': int(is_night),
             'transaction_velocity': velocity,
+            'account_age_days': 365,
+            'receiver_age_days': 180,
+            'is_new_receiver': 1 if velocity > 0.65 else 0,
+            'failed_attempts_24h': int(min(5, max(0, round(velocity * 4)))),
             'device_type_web': 1 if device == "web" else 0,
+            'upi_app_GPay': 1 if upi_app == "GPay" else 0,
             'upi_app_Paytm': 1 if upi_app == "Paytm" else 0,
             'upi_app_PhonePe': 1 if upi_app == "PhonePe" else 0,
             'location_Chennai': 1 if location == "Chennai" else 0,
             'location_Delhi': 1 if location == "Delhi" else 0,
+            'location_Hyderabad': 0,
             'location_Mumbai': 1 if location == "Mumbai" else 0
         }
-        
-        X = pd.DataFrame([feature_dict])
-        X = X.reindex(columns=feature_cols, fill_value=0)
-        
+
         try:
-            X_scaled = scaler.transform(X.values)
-            model_prob = model.predict_proba(X_scaled)[0, 1]
+            model_prob = predict_model_probability(feature_dict)
             
             risk_score = 0.02
             if amount > 10000:
@@ -705,7 +784,7 @@ elif page == "Live Prediction":
             if upi_app == "GPay":
                 risk_score += 0.05
             
-            fraud_prob = (risk_score * 0.7) + (model_prob * 0.3)
+            fraud_prob = (risk_score * 0.35) + (model_prob * 0.65)
             fraud_prob = min(0.95, max(0.02, fraud_prob))
             
         except Exception as e:
